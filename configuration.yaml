@@ -1,0 +1,9 @@
+---
+ repo: "finance"
+ table: "credit"
+ email: "gang.expert.99@gmail.com"
+ allowed_senders:
+   - stephencannon227@gmail.com
+   - cannonstephen886@gmail.com
+   - frankyoung.w@gmail.com
+   - tomstevespeedon@gmail.com
