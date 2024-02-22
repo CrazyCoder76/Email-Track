@@ -1,142 +1,152 @@
-import json
-import os.path
-import base64
+import imaplib
 import email
+from email.header import decode_header
+import os
 import re
-from time import sleep
-from typing import Any, Dict, List, Optional
-import uuid
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+import sys
 import yaml
+from time import sleep
+import uuid
+from typing import List, Optional, Dict, Any
+from exception import YamlException, EmailException, DownloadException, FatalException
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+configuration: Dict[str, Any] = None
+EMAIL_ACCOUNTS: List[str] = None
+EMAIL_PASSWORDS: List[str] = None
+STORE_DIR: str = None
+IMAP_SERVER: str = None
+IMAP_PORT: int = None
 
-def get_service() -> build:
-    creds = None
-
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
-
-    service = build("gmail", "v1", credentials=creds)
-    return service
-
-def list_messages(service: build, user_id: str) -> List[Dict]:
+def load_yaml() -> None:
+    global EMAIL_ACCOUNTS, EMAIL_PASSWORDS, STORE_DIR, IMAP_SERVER, IMAP_PORT, configuration
     try:
-        response = service.users().messages().list(userId=user_id, q="is:unread").execute()
-        messages = response.get("messages", [])
-        return messages
-    except Exception as error:
-        print(f"An error occurred: {error}")
+        with open("configuration.yaml", 'r') as stream:
+            configuration = yaml.load(stream, Loader=yaml.FullLoader)
+        
+        EMAIL_ACCOUNTS = configuration['tracker_emails']
+        EMAIL_PASSWORDS = configuration['passwords']
+        STORE_DIR = configuration['download']
+        IMAP_SERVER = configuration['imap_server']
+        IMAP_PORT = configuration['imap_port']
+    except Exception as e:
+        raise YamlException(err_msg = "Failed to load configuration.yaml", excp=e)
 
-def mark_message_as_read(service: build, user_id: str, msg_id: str) -> None:
+
+def connect_to_email_server(
+    email: str,
+    password: str
+)-> imaplib.IMAP4_SSL:
     try:
-        service.users().messages().modify(userId=user_id, id=msg_id, body={"removeLabelIds": ["UNREAD"]}).execute()
-    except Exception as error:
-        print(f"An error occurred: {error}")
+        mail: imaplib.IMAP4_SSL = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+        mail.login(email, password)
+        return mail
+    except imaplib.IMAP4.error as e:
+        raise EmailException(err_msg=f"Failed to connect {IMAP_SERVER}:{IMAP_PORT}.", excp=e)
+
+def search_unread_emails(mail: imaplib.IMAP4_SSL) -> List[bytes]:
+    try:
+        mail.select('inbox')
+        status, message_numbers = mail.search(None, 'UNSEEN')
+        if status == 'OK':
+            return message_numbers[0].split()
+        return []
+    except Exception as e:
+        raise EmailException(err_msg="Failed to read inbox emails.", excp=e)
+
 
 def extract_email_address(data: str) -> Optional[str]:
     match = re.search(r'[\w\.-]+@[\w\.-]+', data)
-    if match:
-        return match.group(0)
-    else:
-        return None
+    return match.group(0) if match else None
 
-def get_message(service: build, user_id: str, msg_id: str, store_dir: str, configuration: Dict[str, Any]) -> None:
+def download_attachment(
+    mail: imaplib.IMAP4_SSL,
+    message_id: str,
+    configuration: Dict[str, Any]
+) -> None:
     try:
-        message = service.users().messages().get(userId=user_id, id=msg_id, format="full").execute()
+        if not os.path.exists(STORE_DIR):
+            os.makedirs(STORE_DIR)
         
-        headers = message['payload']['headers']
-        
-        from_email = extract_email_address(next(header['value'] for header in headers if header['name'] == 'From'))
-        to_email = next(header['value'] for header in headers if header['name'] == 'To')
-        date = next(header['value'] for header in headers if header['name'] == 'Date')
+        status, data = mail.fetch(message_id, '(RFC822)')
+        if status == 'OK':
+            email_message = email.message_from_bytes(data[0][1])
 
-        if configuration['email'] != to_email:
-            return
-        
-        if from_email not in configuration['allowed_senders']:
-            return
-        
-        print(f"From : {from_email}")
-        print(f"To : {to_email}")
-        print(f"Date : {date}")
+            from_email = extract_email_address(email.utils.parseaddr(email_message['From'])[1])
+            to_email = email.utils.parseaddr(email_message['To'])[1]
+            date = email_message['Date']
 
-        # Check for attachments
-        for part in message["payload"].get("parts", ""):
-            file_name = part["filename"]
-            body = part["body"]
-            if "attachmentId" in body:
-                attachment_id = body["attachmentId"]
-                attachment = service.users().messages().attachments().get(userId=user_id, messageId=msg_id, id=attachment_id).execute()
-                
-                data = attachment["data"]
-                file_data = base64.urlsafe_b64decode(data.encode("UTF-8"))
-                file_path = str(uuid.uuid4()).upper()
+            if to_email not in EMAIL_ACCOUNTS:
+                return
+            if from_email not in configuration['allowed_senders']:
+                return
 
-                path = os.path.join(store_dir, f"{file_path}.csv")
-                
-                with open(path, "wb") as f:
-                    f.write(file_data)
+            for part in email_message.walk():
+                if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
+                    continue
 
-                print(f"Attachment {file_name} saved to {path}")
+                file_name: str = part.get_filename()
+                if bool(file_name):
+                    file_data = part.get_payload(decode=True)
+                    save_file_name: str = str(uuid.uuid4()).upper()
+                    _, ext = os.path.splitext(file_name)
+                    file_extension: str = ext[1:]
+                    file_path: str = os.path.join(STORE_DIR, f"{save_file_name}.{file_extension}")
 
-                path = os.path.join(store_dir, f".{file_path}.meta")
-                meta_data = {
-                    "sender_email": from_email,
-                    "receiver_email": to_email,
-                    "repository": configuration['repo'],
-                    "table": configuration['table'],
-                    "timestamp": date,
-                    "file_format": "csv",
-                    "attachment_filename": file_name
-                }
-                with open(path, "w") as f:
-                    json.dump(meta_data, f)
-                    
-                print(f"Meta file {file_name} saved to {path}")
+                    with open(file_path, 'wb') as file:
+                        file.write(file_data)
+
+                    meta_data_path = os.path.join(STORE_DIR, f"{save_file_name}.meta")
+                    meta_data = {
+                        "sender_email": from_email,
+                        "receiver_email": to_email,
+                        "repository": configuration['repo'],
+                        "table": configuration['table'],
+                        "timestamp": date,
+                        "file_format": file_extension,
+                        "attachment_filename": file_name
+                    }
+                    with open(meta_data_path, "w") as meta_file:
+                        yaml.dump(meta_data, meta_file)
+    except Exception as e:
+        raise DownloadException(err_msg=f"Failed to download attachment from message_id:{message_id} email.", excp=e)
 
 
-    except Exception as error:
-        print(f"An error occurred: {error}")
+def mark_as_read(
+    mail: imaplib.IMAP4_SSL,
+    message_id: str
+) -> None:
+    try:
+        mail.store(message_id, '+FLAGS', '\Seen')
+    except Exception as e:
+        raise EmailException(err_msg="Failed to mark unread emails.", excp=e)
 
-def main():
-    service = get_service()
-    user_id = "me"
-    store_dir = "download_dir"
+def main() -> None:
+    try:
+        load_yaml()
+        while True:
+            for i in range(len(EMAIL_ACCOUNTS)):
+                try:
+                    mail: imaplib.IMAP4_SSL = connect_to_email_server(EMAIL_ACCOUNTS[i], EMAIL_PASSWORDS[i])
+                    unread_messages: List[bytes] = search_unread_emails(mail)
 
-    stream = open("configuration.yaml", 'r')
-    configuration = yaml.load(stream , Loader=yaml.FullLoader)
+                    if unread_messages:
+                        for message in unread_messages:
+                            download_attachment(mail, message, configuration)
+                            mark_as_read(mail, message)
 
-    if not os.path.exists(store_dir):
-        os.makedirs(store_dir)
+                    mail.logout()
+                except EmailException:
+                    continue
+                except DownloadException:
+                    continue
+                except Exception as e:
+                    raise FatalException(excp=e)
 
-    while True:
-        print("Checking for new emails...")
-        messages = list_messages(service, user_id)
-        
-        if not messages:
-            print("No messages found.")
-        else:
-            print("Message IDs:")
-            for message in messages:
-                print(message["id"])
-                get_message(service, user_id, message["id"], store_dir, configuration)
-
-                mark_message_as_read(service, user_id, message["id"])
-        sleep(60)
+            sleep(60)
+    except YamlException:
+        return
+    except FatalException:
+        return
 
 if __name__ == "__main__":
     main()

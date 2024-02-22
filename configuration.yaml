@@ -1,9 +1,16 @@
 ---
  repo: "finance"
  table: "credit"
- email: "gang.expert.99@gmail.com"
+ imap_server: "imap.gmail.com"
+ imap_port: 993
+ download: "download_dir"
+ tracker_emails:
+   - "gang.expert.99@gmail.com"
+ passwords:
+   - "qyiiktcmicwxlfgh"
  allowed_senders:
    - stephencannon227@gmail.com
    - cannonstephen886@gmail.com
    - frankyoung.w@gmail.com
    - tomstevespeedon@gmail.com
+   - jangamsravan607@gmail.com
